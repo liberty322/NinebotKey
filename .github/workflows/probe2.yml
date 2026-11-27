@@ -1,0 +1,21 @@
+name: probe2
+on:
+  workflow_dispatch:
+
+jobs:
+  m12:
+    runs-on: macos-12
+    steps:
+      - run: echo macos12 && sw_vers
+  m13:
+    runs-on: macos-13
+    steps:
+      - run: echo macos13 && sw_vers
+  m15:
+    runs-on: macos-15
+    steps:
+      - run: echo macos15 && sw_vers
+  m14a:
+    runs-on: macos-14
+    steps:
+      - run: echo arm14 && uname -m
