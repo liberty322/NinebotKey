@@ -1,0 +1,8 @@
+build/
+*.ipa
+*.app
+DerivedData/
+.DS_Store
+xcuserdata/
+*.xcuserstate
+__pycache__/
