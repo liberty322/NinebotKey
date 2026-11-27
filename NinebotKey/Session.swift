@@ -23,10 +23,17 @@ final class NinebotSession: NSObject, ObservableObject {
     @Published var isScanning = false
     @Published var connected = false
     @Published var deviceName = ""
+    @Published var gattName = ""
+    @Published var scanName = ""
+    @Published var nameCandidates: [String] = []
     @Published var authParamHex = ""
     @Published var snHex = ""
     @Published var credential: Credential?
     @Published var busy = false
+    @Published var rawMode = false
+    @Published var rawLast = ""
+
+    private var rawBuf: [UInt8] = []
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -53,6 +60,21 @@ final class NinebotSession: NSObject, ObservableObject {
 
     private func inboxClear() {
         lock.lock(); inboxStore.removeAll(); lock.unlock()
+    }
+
+    private func refreshCandidates() {
+        var out: [String] = []
+        for s in [gattName, scanName, peripheral?.name ?? ""] where !s.isEmpty {
+            if !out.contains(s) { out.append(s) }
+        }
+        nameCandidates = out
+        if !gattName.isEmpty {
+            deviceName = gattName
+        } else if !scanName.isEmpty {
+            deviceName = scanName
+        }
+        addLog("key1 候选 = " + (out.isEmpty ? "(空)" : out.joined(separator: " / "))
+               + "，当前 key1 = " + deviceName)
     }
 
     override init() {
@@ -121,7 +143,10 @@ final class NinebotSession: NSObject, ObservableObject {
         }
         stopScan()
         peripheral = d.peripheral
+        gattName = ""
+        scanName = d.name
         deviceName = d.name
+        nameCandidates = []
         addLog("连接 \(d.name) …")
         if c.state == .poweredOn, d.peripheral.state == .connected {
             try await prepareGATT()
@@ -154,6 +179,14 @@ final class NinebotSession: NSObject, ObservableObject {
             }
         }
         connected = true
+        refreshCandidates()
+        // 2A00 读不到时给明确提示，别让用户拿着错 key1 干等
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            if self.gattName.isEmpty {
+                self.addLog("⚠️ 没读到 GATT 2A00 设备名，当前 key1 是广播名。"
+                            + "若 0x5B 无回包，请手填车上显示的蓝牙名（如 波音747）再试。")
+            }
+        }
     }
 
     func disconnect() {
@@ -202,14 +235,22 @@ final class NinebotSession: NSObject, ObservableObject {
     // MARK: - 协议
 
     /// ① PRE_COMM：拿 authParam + SN
-    func precomm(key1: String, advSNLen: Int?) async throws -> (Data, Data) {
+    func precomm(key1: String, advSNLen: Int?, timeout: TimeInterval = 12) async throws -> (Data, Data) {
         crypto = V2Crypto()
         crypto.reset()
         let key1Data = Data(key1.utf8.suffix(16))
         crypto.setKey(key1Data, nil)
         addLog("PRE_COMM key1=\"\(key1)\" (\(key1Data.count)B) key=\(Hex.of(Data(crypto.key)))")
         try await send(Frame(src: 0x3E, dst: 0x04, cmd: 0x5B))
-        let f = try await recv(timeout: 12)
+        let f: Frame
+        do {
+            f = try await recv(timeout: timeout)
+        } catch {
+            addLog("❌ 0x5B 无回包（key1=\"\(key1)\" 派生 key=\(Hex.of(Data(crypto.key)))）")
+            addLog("   两个可能：① key1 不对——把车上显示的蓝牙名手填进「设备名 key1」；"
+                   + "② 这车只认 V3Auth(Gen3)，不答 Enc2 的 0x5B。")
+            throw error
+        }
         guard f.cmd == 0x5B else { throw CryptoError.bad("期望 0x5B，收到 \(Hex.byte(f.cmd))") }
         guard f.payload.count >= 17 else { throw CryptoError.bad("回包太短 \(f.payload.count)B") }
         let auth = Data(f.payload.prefix(16))
@@ -221,6 +262,49 @@ final class NinebotSession: NSObject, ObservableObject {
         snHex = Hex.of(rest)
         addLog("authParam=\(authParamHex)  SN=\(snHex)  (\(rest.count)B)")
         return (auth, rest)
+    }
+
+    /// 依次用每个候选 key1 试 0x5B，返回第一个有回包的名字
+    func autoProbe(extra: String) async -> (String, Data, Data)? {
+        var list = nameCandidates
+        let t = extra.trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty, !list.contains(t) { list.insert(t, at: 0) }
+        guard !list.isEmpty else { return nil }
+        busy = true
+        defer { busy = false }
+        for name in list {
+            do {
+                let (auth, sn) = try await precomm(key1: name, advSNLen: nil, timeout: 5)
+                addLog("✅ key1=\"\(name)\" 有回包，用它")
+                deviceName = name
+                return (name, auth, sn)
+            } catch {
+                addLog("…\"\(name)\" 没反应，换下一个")
+                try? await Task.sleep(nanoseconds: 400_000_000)
+            }
+        }
+        status = "所有 key1 候选都没回包 → 大概率是 V3Auth 车"
+        return nil
+    }
+
+    // MARK: - 原始帧（V3 探测用，不做 Enc2 加密）
+
+    func sendRaw(hex: String) async throws {
+        guard let p = peripheral, let ch = writeChar else { throw CryptoError.bad("通道未就绪") }
+        let clean = hex.replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "0x", with: "")
+        guard let data = Hex.data(clean), !data.isEmpty else { throw CryptoError.bad("hex 不合法") }
+        let type: CBCharacteristicWriteType =
+            ch.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        var i = 0
+        while i < data.count {
+            let end = min(i + 20, data.count)
+            p.writeValue(data.subdata(in: i..<end), for: ch, type: type)
+            i = end
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        addLog("RAW TX \(data.count)B \(Hex.of(data))")
     }
 
     /// ②③ 用给定密码认证
@@ -399,12 +483,19 @@ extension NinebotSession: CBPeripheralDelegate {
         guard let data = characteristic.value, !data.isEmpty else { return }
         if characteristic.uuid == NinebotSession.nameUUID {
             if let s = String(data: data, encoding: .utf8), !s.isEmpty {
-                deviceName = s
+                gattName = s
+                refreshCandidates()
                 addLog("GATT 设备名 = \(s)")
             }
             return
         }
         if characteristic.uuid == NinebotSession.notifyUUID {
+            if rawMode {
+                rawBuf.append(contentsOf: [UInt8](data))
+                if rawBuf.count > 4096 { rawBuf.removeFirst(rawBuf.count - 4096) }
+                rawLast = Hex.of(Data(rawBuf))
+                addLog("RAW RX +\(data.count)B 累计\(rawBuf.count)B: \(Hex.of(data))")
+            }
             for raw in asm.feed(data) {
                 inboxPush(raw)
                 addLog("NOTIFY \(raw.count)B \(Hex.of(Data(raw.prefix(8))))…")
