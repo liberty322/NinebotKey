@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var nameOverride = ""
     @State private var pwdInput = ""
     @State private var identInput = ""
+    @State private var rawHex = ""
     @State private var toast = ""
     @State private var showLog = false
 
@@ -24,6 +25,7 @@ struct ContentView: View {
                 if s.connected || !s.authParamHex.isEmpty { paramSection }
                 actionSection
                 if let c = s.credential { resultSection(c) }
+                if s.connected { rawSection }
                 logSection
                 aboutSection
             }
@@ -117,6 +119,16 @@ struct ContentView: View {
             }
             Button("读取认证参数（0x5B）") { Task { await doPrecomm() } }
                 .disabled(s.busy || !s.connected)
+            Button {
+                Task { await doAutoProbe() }
+            } label: {
+                Label("自动试所有 key1 候选", systemImage: "wand.and.rays")
+            }
+            .disabled(s.busy || !s.connected)
+            if !s.nameCandidates.isEmpty {
+                Text("候选：" + s.nameCandidates.joined(separator: " / "))
+                    .font(.caption2).foregroundColor(.secondary)
+            }
         }
     }
 
@@ -198,8 +210,32 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 日志
+    // MARK: - 原始帧 / V3 探测
 
+    private var rawSection: some View {
+        Section(header: Text("⑤ 原始帧（V3 探测用，不加密）"),
+                footer: Text("V3Auth(Gen3) 的车不答 Enc2 的 0x5B，改用 0x6005/0x6006。这里可以直接把整帧 hex 写进 NUS，看车回什么。")) {
+            Toggle("记录原始 RX", isOn: $s.rawMode)
+            HStack {
+                TextField("如 5AA5... ", text: $rawHex)
+                    .textInputAutocapitalization(.never)
+                    .disableAutocorrection(true)
+                    .font(.system(.footnote, design: .monospaced))
+                Button("发送") { Task { await doRawSend() } }
+                    .disabled(s.busy || !s.connected || rawHex.isEmpty)
+            }
+            if !s.rawLast.isEmpty {
+                Text(s.rawLast)
+                    .font(.system(size: 10, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+            Button("清空接收缓冲") {
+                s.rawLast = ""
+            }.font(.caption)
+        }
+    }
+
+    // MARK: - 日志
     private var logSection: some View {
         Section(header: HStack {
             Text("日志")
@@ -252,6 +288,25 @@ struct ContentView: View {
     private func advSNLen() -> Int? {
         let d = s.devices.first { $0.name == s.deviceName }
         return d?.adv?.serial?.count
+    }
+
+    private func doAutoProbe() async {
+        toast = "逐个候选试 0x5B…"
+        if let r = await s.autoProbe(extra: nameOverride) {
+            nameOverride = r.0
+            toast = "key1=\"\(r.0)\" 有回包"
+        } else {
+            toast = "全部候选都没回包 → 大概率 V3Auth 车"
+        }
+    }
+
+    private func doRawSend() async {
+        do {
+            try await s.sendRaw(hex: rawHex)
+            toast = "已发送原始帧"
+        } catch {
+            toast = "发送失败：\(error.localizedDescription)"
+        }
     }
 
     private func doPrecomm() async {
