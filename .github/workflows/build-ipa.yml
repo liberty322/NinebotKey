@@ -1,0 +1,35 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 显示环境
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: 编译并打包
+        run: bash build_ipa.sh
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NinebotKey-unsigned-ipa
+          path: build/NinebotKey-unsigned.ipa
+          if-no-files-found: error
+
+      - name: 失败时导出日志
+        if: failure()
+        run: |
+          echo "--- build dir ---"
+          ls -la build 2>/dev/null || true
